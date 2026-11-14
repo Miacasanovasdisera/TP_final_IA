@@ -1,0 +1,43 @@
+{
+  "semilla": 42,
+  "vista": "4CH",
+  "canales": [
+    "ED",
+    "ES"
+  ],
+  "tam_imagen": 128,
+  "epocas_maximas": 80,
+  "batch_size": 16,
+  "paciencia": 12,
+  "learning_rate": 0.001,
+  "regularizacion_l2_cnn": 0.001,
+  "capas_con_l2": [
+    "Conv2D(16)",
+    "Conv2D(32)",
+    "Dense(32)"
+  ],
+  "sobremuestreo_regresion": true,
+  "aumentos": false,
+  "filtrado_imagen": false,
+  "seleccion_por_calidad": false,
+  "mediana_train": 67.0,
+  "pesos_preentrenados": false,
+  "keras": "3.15.1",
+  "torch": "2.15.0+cpu",
+  "backend": "torch",
+  "prueba_tecnica": false,
+  "fuentes_catedra": [
+    "IA2026_NN_Regressor (1).ipynb",
+    "IA2026_CNN_MNIST.ipynb"
+  ],
+  "flujo": "imagen -> codificador de autoencoder -> mapa latente -> CNN -> edad",
+  "dimension_latente": [
+    16,
+    16,
+    8
+  ],
+  "epocas_autoencoder_maximas": 60,
+  "paciencia_autoencoder": 8,
+  "normalizacion_latente": "media y desv\u00edo por canal, solo pacientes \u00fanicos de train",
+  "test_evaluado": false
+}

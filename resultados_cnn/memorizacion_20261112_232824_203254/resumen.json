@@ -1,0 +1,13 @@
+{
+  "cnn_memoriza": false,
+  "mlp_embedding_memoriza": true,
+  "mae_cnn": 2.7885444164276123,
+  "mae_mlp_embedding": 0.7437303066253662,
+  "epocas_cnn": 1000,
+  "epocas_mlp": 228,
+  "std_pred_cnn": 16.474212646484375,
+  "std_edades": 17.64227867126465,
+  "features_con_variacion": 62,
+  "rango_matriz_embedding_centrada": 15,
+  "interpretacion": "Solo ajuste a los mismos 16 pacientes; no hay validaci\u00f3n ni test en este resultado."
+}

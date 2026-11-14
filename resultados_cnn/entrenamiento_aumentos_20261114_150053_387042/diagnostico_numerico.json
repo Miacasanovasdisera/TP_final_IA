@@ -1,0 +1,20 @@
+{
+  "canales_constantes": [
+    1,
+    3
+  ],
+  "maximos_con_aumentos": [
+    0.0,
+    0.019036326557397842
+  ],
+  "pacientes_con_activacion_nueva": 1,
+  "predicciones_referencia_identicas": true,
+  "escala_anterior": [
+    1e-06,
+    1e-06
+  ],
+  "escala_segura": [
+    1.0,
+    1.0
+  ]
+}

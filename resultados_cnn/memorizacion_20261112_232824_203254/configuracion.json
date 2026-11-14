@@ -1,0 +1,15 @@
+{
+  "particiones_origen": "C:\\Academico\\Facultad\\IA\\Proyecto final\\resultados_cnn\\entrenamiento_20261112_231222_995627\\particiones.csv",
+  "n_pacientes": 16,
+  "seleccion": "edades distribuidas dentro de train",
+  "epocas_maximas": 1000,
+  "umbral_mae_anios": 1.0,
+  "dim_embedding": 64,
+  "aumentos": false,
+  "sobremuestreo": false,
+  "dropout": false,
+  "pesos_preentrenados": false,
+  "evaluacion": "mismos pacientes usados para ajustar",
+  "validez": "diagn\u00f3stico de memorizaci\u00f3n; no estima generalizaci\u00f3n",
+  "semilla": 42
+}

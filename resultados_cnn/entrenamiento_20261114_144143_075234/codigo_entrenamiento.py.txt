@@ -1,0 +1,590 @@
+# %% 1. Un único flujo: imagen -> espacio latente -> CNN -> edad
+r"""Ejecutar desde la terminal de VS Code:
+    .\.venv\Scripts\python.exe "ModeloRegresion CNN.py"
+
+Prueba corta de funcionamiento (no produce una evaluación del modelo):
+    .\.venv\Scripts\python.exe "ModeloRegresion CNN.py" --prueba
+
+Todo el flujo se define en este archivo. Los archivos de resultados son tablas,
+gráficos y un único modelo final guardado, no nuevas versiones del código.
+
+  ETAPA 1: un autoencoder aprende a reconstruir las imágenes sin usar edades.
+  Su codificador produce un MAPA LATENTE de 16x16x8, que conserva organización
+  espacial. El decodificador solo sirve para entrenar y comprobar reconstrucción.
+  ETAPA 2: se congela el codificador y una CNN aprende a estimar la edad sobre
+  esos mapas latentes. Esos mapas no se aplanan antes de las convoluciones.
+
+El modelo_final.keras une codificador y CNN regresora y recibe las imágenes.
+No se aplican filtros de suavizado ni se excluyen pacientes por calidad.
+Reconstruir bien no garantiza predecir bien la edad: se evalúa en validación.
+El test permanece reservado; este script no calcula sus predicciones.
+
+Referencias locales de la cátedra, leídas sin ejecutar sus celdas:
+  IA2026_NN_Regressor (1).ipynb: myModel, trainMyModel, makePredictions,
+      plotPredictionsOnTwoAxes, plotPredictionsSeparated, plotTwoModels.
+  IA2026_CNN_MNIST.ipynb: Conv2D, MaxPool2D, Dropout, prep_pixels y aumentos.
+  IA2026_NN_Práctica_Regresión.ipynb: ejercicio de regresión tabular;
+      no contiene funciones adicionales de validación.
+Las funciones de abajo son ADAPTACIONES, no copias sin cambios: reciben
+imágenes, separan pacientes antes del sobremuestreo y predicen una edad continua.
+
+El notebook crediticio inspira las barras comparativas, el mapa por intervalos
+y los gráficos por grupos. Precision/recall, accuracy y ROC no se trasladan a
+esta regresión. La curva de tolerancia muestra P(|error| <= años), no una ROC.
+
+Se mantiene Keras (como en la cátedra), con PyTorch como backend de cálculo.
+No se descargan redes ni pesos preentrenados. Entradas: ED y ES de 4CH como
+dos canales de una misma muestra. No entran edad, sexo, FE, FPS ni máscaras.
+"""
+
+from pathlib import Path
+from datetime import datetime
+import argparse
+import json
+import os
+import warnings
+
+BASE = Path(__file__).resolve().parent
+os.environ["KERAS_BACKEND"] = "torch"  # Debe estar antes de importar Keras.
+os.environ.setdefault("KERAS_HOME", str(BASE / ".keras"))
+
+try:
+    import numpy as np
+    import pandas as pd
+    import nibabel as nib
+    import matplotlib.pyplot as plt
+    from PIL import Image
+    import torch
+    import keras
+    from keras import layers
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+except ImportError as error:
+    raise SystemExit(
+        "Faltan dependencias. Usá el Python del entorno .venv.\n"
+        "Instalación: python -m pip install torch keras scikit-learn "
+        "numpy pandas matplotlib nibabel pillow"
+    ) from error
+
+
+# %% 2. Configuración del experimento
+RUTA_DATASET = BASE / "CAMUS_public" / "CAMUS_public" / "database_nifti"
+CARPETA_RESULTADOS = BASE / "resultados_cnn"
+SEMILLA = 42
+TAM_IMAGEN = 128
+VISTA = "4CH"
+EPOCAS = 80
+EPOCAS_AUTOENCODER = 60
+PACIENCIA_AUTOENCODER = 8
+BATCH_SIZE = 16
+PACIENCIA = 12
+TASA_APRENDIZAJE = 0.001
+L2_CNN = 0.001  # Ensayo de L2 en la CNN regresora; 0.0 desactiva la penalización.
+MOSTRAR_GRAFICOS = False  # Los PNG se guardan siempre; True también abre ventanas.
+USAR_SOBREMUESTREO = True  # Solo train; hasta 3 veces cada rango poco representado.
+DIMENSION_LATENTE = (16, 16, 8)
+# Rangos suficientemente amplios para repartir los pocos pacientes jóvenes.
+# Sirven para particionar y muestrear; el objetivo NO se convierte en categorías.
+BORDES_EDAD = [0, 40, 50, 60, 70, 80, np.inf]
+
+
+# %% 3. Etiquetas y rutas: una muestra por paciente
+def leer_cfg(ruta):
+    return dict(
+        tuple(parte.strip() for parte in linea.split(":", 1))
+        for linea in ruta.read_text(encoding="utf-8-sig").splitlines()
+        if ":" in linea
+    )
+
+
+def cargar_dataset():
+    """Adaptación de cargar_dataset de MNIST: CAMUS local y edades numéricas."""
+    filas = []
+    for carpeta in sorted(RUTA_DATASET.glob("patient*")):
+        datos = leer_cfg(carpeta / f"Info_{VISTA}.cfg")
+        otra_vista = "2CH" if VISTA == "4CH" else "4CH"
+        otros = leer_cfg(carpeta / f"Info_{otra_vista}.cfg")
+        edad = float(datos["Age"])
+        if not np.isfinite(edad) or edad <= 0 or edad != float(otros["Age"]):
+            raise ValueError(f"Revisar edad de {carpeta.name} antes de entrenar.")
+        fila = {"Paciente": carpeta.name, "Edad": edad, "Sexo": datos["Sex"],
+                "FE": float(datos["EF"]), "FPS": float(datos["FrameRate"])}
+        for fase in ("ED", "ES"):
+            archivo = carpeta / f"{carpeta.name}_{VISTA}_{fase}.nii.gz"
+            if not archivo.is_file():
+                raise FileNotFoundError(f"Falta imagen: {archivo}")
+            fila[f"Ruta_{fase}"] = str(archivo)
+        filas.append(fila)
+    df = pd.DataFrame(filas)
+    if len(df) < 30:
+        raise ValueError("Hay muy pocos pacientes o RUTA_DATASET no es correcta.")
+    if not df["Paciente"].is_unique:
+        raise ValueError("Hay pacientes repetidos en la tabla.")
+    df["Rango_edad"] = pd.cut(df["Edad"], BORDES_EDAD, right=False).astype(str)
+    print(f"Pacientes: {len(df)} | Entradas: imágenes {VISTA} ED y ES", flush=True)
+    return df
+
+
+def separar_pacientes(df):
+    """70 % train, 15 % validación para early stopping y 15 % prueba final."""
+    indices = np.arange(len(df))
+    desarrollo, test = train_test_split(
+        indices, test_size=0.15, random_state=SEMILLA, stratify=df["Rango_edad"]
+    )
+    train, val = train_test_split(
+        desarrollo, test_size=0.15 / 0.85, random_state=SEMILLA,
+        stratify=df.iloc[desarrollo]["Rango_edad"]
+    )
+    conjuntos = [set(df.iloc[idx]["Paciente"]) for idx in (train, val, test)]
+    assert not (conjuntos[0] & conjuntos[1] or conjuntos[0] & conjuntos[2] or conjuntos[1] & conjuntos[2])
+    assert len(set.union(*conjuntos)) == len(df)
+    print(f"Partición por paciente: train={len(train)}, validación={len(val)}, test={len(test)}")
+    return train, val, test
+
+
+def prep_pixels(tabla):
+    """Adaptación de prep_pixels: NIfTI -> 128x128x2 -> float32 entre 0 y 1.
+
+    Se conserva la proporción de la imagen mediante relleno negro, sin recortar
+    el corazón. La división por 255 es fija: no aprende estadísticas del test.
+    ED y ES ocupan los canales 0 y 1 de la MISMA muestra del paciente.
+    """
+    X = np.empty((len(tabla), TAM_IMAGEN, TAM_IMAGEN, 2), dtype=np.float32)
+    for i, fila in enumerate(tabla.itertuples(index=False)):
+        for canal, ruta in enumerate((fila.Ruta_ED, fila.Ruta_ES)):
+            datos = np.squeeze(np.asarray(nib.load(ruta).dataobj, dtype=np.float32))
+            if datos.ndim != 2 or not np.isfinite(datos).all():
+                raise ValueError(f"Imagen inválida: {ruta}, shape={datos.shape}")
+            if datos.min() < 0 or datos.max() > 255:
+                raise ValueError(f"Revisar escala de intensidades (esperada 0..255): {ruta}")
+            imagen = Image.fromarray(datos.T)
+            factor = TAM_IMAGEN / max(imagen.size)
+            ancho, alto = [max(1, round(lado * factor)) for lado in imagen.size]
+            imagen = imagen.resize((ancho, alto), Image.Resampling.BILINEAR)
+            lienzo = np.zeros((TAM_IMAGEN, TAM_IMAGEN), dtype=np.float32)
+            y0, x0 = (TAM_IMAGEN - alto) // 2, (TAM_IMAGEN - ancho) // 2
+            lienzo[y0:y0 + alto, x0:x0 + ancho] = np.asarray(imagen)
+            X[i, :, :, canal] = np.clip(lienzo, 0, 255) / 255.0
+        if (i + 1) % 50 == 0:
+            print(f"Imágenes preparadas: {i + 1}/{len(tabla)}", flush=True)
+    return X
+
+
+def sobremuestrear_train(tabla):
+    """Repetir índices de train; no inventar edades ni nuevos pacientes."""
+    rng = np.random.default_rng(SEMILLA)
+    grupos = tabla.groupby("Rango_edad", observed=True).indices
+    mayor_grupo = max(len(indices) for indices in grupos.values())
+    seleccion = []
+    for indices in grupos.values():
+        seleccion.extend(indices)
+        # Incluimos todos los originales y agregamos como máximo dos copias.
+        objetivo = min(mayor_grupo, 3 * len(indices))
+        if objetivo > len(indices):
+            seleccion.extend(rng.choice(indices, objetivo - len(indices), replace=True))
+    seleccion = np.asarray(seleccion, dtype=int)
+    rng.shuffle(seleccion)
+    return seleccion
+
+
+# %% 4. Espacio latente: aprender a comprimir y reconstruir SIN etiquetas de edad
+def crear_autoencoder():
+    """El mapa 16x16x8 conserva posiciones vecinas; no es un vector reordenado.
+
+    Un autoencoder aprende reconstrucción, no genera una imagen 'limpia' ni
+    garantiza que lo conservado permita estimar edad. No hay filtrado previo.
+    Referencia de API: https://keras.io/examples/vision/autoencoder/
+    """
+    entrada = keras.Input(shape=(TAM_IMAGEN, TAM_IMAGEN, 2), name="ecocardiogramas")
+    x = entrada
+    for canales in (8, 16, 8):
+        x = layers.Conv2D(canales, 3, strides=2, padding="same", activation="relu")(x)
+    codificador = keras.Model(entrada, x, name="codificador_latente")
+    if tuple(codificador.output_shape[1:]) != DIMENSION_LATENTE:
+        raise ValueError("La configuración no coincide con la dimensión latente esperada.")
+    mapa = keras.Input(shape=DIMENSION_LATENTE, name="mapa_latente")
+    x = layers.Conv2DTranspose(16, 3, strides=2, padding="same", activation="relu")(mapa)
+    x = layers.Conv2DTranspose(8, 3, strides=2, padding="same", activation="relu")(x)
+    reconstruccion = layers.Conv2DTranspose(2, 3, strides=2, padding="same", activation="sigmoid")(x)
+    decodificador = keras.Model(mapa, reconstruccion, name="decodificador_entrenamiento")
+    autoencoder = keras.Model(entrada, decodificador(codificador(entrada)), name="autoencoder")
+    autoencoder.compile(optimizer=keras.optimizers.Adam(0.001), loss="mse", jit_compile=False)
+    return autoencoder, codificador
+
+
+def entrenar_autoencoder(autoencoder, X_train, X_val, salida, epocas):
+    """Las imágenes de train son entrada y objetivo; no se usan edades."""
+    salida.mkdir()
+    hist = autoencoder.fit(
+        X_train, X_train, validation_data=(X_val, X_val), epochs=epocas,
+        batch_size=BATCH_SIZE, shuffle=True, verbose=2,
+        callbacks=[
+            keras.callbacks.EarlyStopping(monitor="val_loss", patience=PACIENCIA_AUTOENCODER,
+                                          restore_best_weights=True),
+            keras.callbacks.TerminateOnNaN(),
+            keras.callbacks.CSVLogger(str(salida / "historial.csv")),
+        ],
+    )
+    if not all(np.isfinite(valores).all() for valores in hist.history.values()):
+        raise RuntimeError("La reconstrucción produjo errores no finitos.")
+    fig, ax = plt.subplots(figsize=(9, 5))
+    epocas_grafico = np.arange(1, len(hist.history["loss"]) + 1)
+    ax.plot(epocas_grafico, hist.history["loss"], marker="o", markersize=3, label="Entrenamiento")
+    ax.plot(epocas_grafico, hist.history["val_loss"], marker="o", markersize=3, label="Validación")
+    ax.set(xlabel="Época", ylabel="MSE de intensidades normalizadas",
+           title="Autoencoder: error de reconstrucción")
+    ax.legend()
+    guardar_figura(fig, salida, "01_error_reconstruccion.png")
+    reconstruidas = np.asarray(autoencoder.predict(X_val[:2], verbose=0))
+    fig, axes = plt.subplots(2, 4, figsize=(11, 6))
+    for i in range(2):
+        for canal in range(2):
+            for offset, (imagenes, nombre) in enumerate([(X_val, "Original"), (reconstruidas, "Reconstrucción")]):
+                ax = axes[i, canal * 2 + offset]
+                ax.imshow(imagenes[i, :, :, canal], cmap="gray", vmin=0, vmax=1)
+                ax.set_title(f"{nombre} {['ED', 'ES'][canal]}", fontsize=10)
+                ax.axis("off")
+    guardar_figura(fig, salida, "02_comprobacion_reconstruccion.png")
+    return hist
+
+
+def guardar_latentes(codificador, X, tabla, salida):
+    salida.mkdir()
+    Z = np.asarray(codificador.predict(X, batch_size=BATCH_SIZE, verbose=0), dtype=np.float32)
+    if Z.shape != (len(tabla), *DIMENSION_LATENTE) or not np.isfinite(Z).all():
+        raise ValueError("Mapas latentes inválidos.")
+    np.save(salida / "mapas_latentes.npy", Z)
+    tabla[["Paciente", "Edad", "Sexo"]].to_csv(salida / "pacientes.csv", index=False)
+    return Z
+
+
+# %% 5. CNN regresora: convoluciones SOBRE el mapa latente
+def myModel(Z_train, edad_media_train):
+    """Adaptación de las funciones de la cátedra. La entrada ya es latente."""
+    media = Z_train.mean(axis=(0, 1, 2))
+    escala = np.maximum(Z_train.std(axis=(0, 1, 2)), 1e-6)
+    modelo = keras.Sequential([
+        keras.Input(shape=DIMENSION_LATENTE),
+        layers.Normalization(axis=-1, mean=media, variance=escala ** 2, name="normalizacion_train"),
+        layers.Conv2D(16, 3, padding="same", activation="relu",
+                      kernel_regularizer=keras.regularizers.L2(L2_CNN)),
+        layers.MaxPool2D(2),
+        layers.Conv2D(32, 3, padding="same", activation="relu",
+                      kernel_regularizer=keras.regularizers.L2(L2_CNN)),
+        layers.MaxPool2D(2),
+        layers.Flatten(),
+        layers.Dense(32, activation="relu", kernel_regularizer=keras.regularizers.L2(L2_CNN)),
+        layers.Dropout(0.15, seed=SEMILLA),
+        layers.Dense(1, activation="linear",
+                     bias_initializer=keras.initializers.Constant(edad_media_train)),
+    ], name="CNN_regresora_latente")
+    modelo.compile(optimizer=keras.optimizers.Adam(TASA_APRENDIZAJE), loss="mse",
+                   metrics=[keras.metrics.MeanAbsoluteError(name="mae")], jit_compile=False)
+    return modelo, media, escala
+
+
+def guardar_figura(figura, salida, nombre):
+    if any(parte.startswith("prueba_") for parte in salida.parts):
+        figura.suptitle("PRUEBA TÉCNICA — no mide rendimiento", fontsize=11)
+    elif salida.name in ("validacion", "test"):
+        figura.suptitle("Validación" if salida.name == "validacion" else "Prueba final (test)", fontsize=11)
+    figura.tight_layout()
+    figura.savefig(salida / nombre, dpi=150, bbox_inches="tight")
+    if not MOSTRAR_GRAFICOS:
+        plt.close(figura)
+
+
+# %% 6. Entrenamiento y curva MAE de la cátedra para la CNN regresora
+def trainMyModel(model, X_train, y_train, X_val, y_val, salida, epocas=EPOCAS,
+                 *, paciencia=PACIENCIA, etiqueta_train="Entrenamiento"):
+    result = model.fit(
+        X_train, y_train, validation_data=(X_val, y_val),
+        epochs=epocas, batch_size=BATCH_SIZE, shuffle=True, verbose=2,
+        callbacks=[
+            keras.callbacks.EarlyStopping(monitor="val_mae", mode="min", patience=paciencia,
+                                          restore_best_weights=True),
+            keras.callbacks.ReduceLROnPlateau(monitor="val_mae", mode="min", patience=5,
+                                              factor=0.5, min_lr=1e-5),
+            keras.callbacks.TerminateOnNaN(),
+            keras.callbacks.CSVLogger(str(salida / "historial.csv")),
+        ],
+    )
+    if not all(np.isfinite(valores).all() for valores in result.history.values()):
+        raise RuntimeError("El entrenamiento produjo valores no finitos.")
+    epocas_grafico = np.arange(1, len(result.history["loss"]) + 1)
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(epocas_grafico, result.history["mae"], marker="o", markersize=3, label=etiqueta_train)
+    ax.plot(epocas_grafico, result.history["val_mae"], marker="o", markersize=3, label="Validación")
+    ax.set(xlabel="Época", ylabel="MAE (años)", title="CNN sobre mapa latente: error de edad")
+    ax.legend()
+    guardar_figura(fig, salida, "01_error_cnn.png")
+    return result
+
+
+def makePredictions(model, X_test, y_test):
+    """Misma finalidad que en la cátedra; reshape(-1) también admite un paciente."""
+    predicted_value = np.asarray(model.predict(X_test, batch_size=BATCH_SIZE, verbose=0)).reshape(-1)
+    if predicted_value.shape != np.asarray(y_test).shape or not np.isfinite(predicted_value).all():
+        raise ValueError("Predicciones inválidas o con dimensión incorrecta.")
+    return predicted_value
+
+
+# %% 7. Gráficos de predicciones de la cátedra, adaptados a CAMUS
+def plotPredictionsOnTwoAxes(predicted_value, X_test, y_test, salida):
+    """FE y FPS se usan SOLO como ejes de diagnóstico; no entran a la CNN."""
+    fig, axes = plt.subplots(2, 1, figsize=(9, 8))
+    for ax, columna in zip(axes, ["FE", "FPS"]):
+        ax.scatter(X_test[columna], y_test, label="Edad real", alpha=0.65)
+        ax.scatter(X_test[columna], predicted_value, label="Edad predicha", alpha=0.65)
+        ax.set(xlabel=columna, ylabel="Edad (años)", title=f"Predicciones según {columna} (solo diagnóstico)")
+        ax.legend()
+    guardar_figura(fig, salida, "02_predicciones_dos_ejes_catedra.png")
+
+
+def plotPredictionsSeparated(predicted_value, X_test, y_test, salida):
+    fig, axes = plt.subplots(2, 2, figsize=(11, 8), sharey=True)
+    for fila, columna in enumerate(["FE", "FPS"]):
+        for col, (valores, titulo) in enumerate([(y_test, "Edad real"), (predicted_value, "Edad predicha")]):
+            axes[fila, col].scatter(X_test[columna], valores, alpha=0.65)
+            axes[fila, col].set(xlabel=columna, ylabel="Edad (años)", title=titulo)
+    guardar_figura(fig, salida, "03_predicciones_separadas_catedra.png")
+
+
+def plotTwoModels(true_value, predicted_value1, predicted_value2, salida, nombre_modelo="CNN desde cero"):
+    """Adaptación: comparar CNN y referencia de mediana sobre los mismos pacientes."""
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5), sharex=True, sharey=True)
+    limites = [min(np.min(a) for a in [true_value, predicted_value1, predicted_value2]) - 2,
+               max(np.max(a) for a in [true_value, predicted_value1, predicted_value2]) + 2]
+    for ax, pred, nombre in zip(axes, [predicted_value1, predicted_value2], [nombre_modelo, "Mediana de train"]):
+        ax.scatter(true_value, pred, alpha=0.65)
+        ax.plot(limites, limites, "k--", label="Predicción perfecta")
+        ax.set(xlim=limites, ylim=limites, xlabel="Edad real (años)", ylabel="Edad predicha (años)", title=nombre)
+        ax.legend()
+    guardar_figura(fig, salida, "04_real_vs_predicha_comparacion.png")
+
+
+# %% 8. Métricas de regresión y diagnósticos inspirados en el proyecto crediticio
+def metricas_regresion(real, pred):
+    real, pred = np.asarray(real), np.asarray(pred)
+    error = pred - real
+    return {
+        "MAE": float(mean_absolute_error(real, pred)),
+        "MSE": float(mean_squared_error(real, pred)),
+        "RMSE": float(np.sqrt(mean_squared_error(real, pred))),
+        "R2": float(r2_score(real, pred)) if len(real) > 1 and np.ptp(real) > 0 else np.nan,
+        "Sesgo_pred_menos_real": float(error.mean()),
+        "Dentro_5_anios_pct": float(100 * np.mean(np.abs(error) <= 5)),
+        "Dentro_10_anios_pct": float(100 * np.mean(np.abs(error) <= 10)),
+    }
+
+
+def evaluar_regresion(tabla, pred, mediana_train, salida, nombre, nombre_modelo="CNN"):
+    """Una fila y un voto por paciente; sin aumentos ni sobremuestreo al evaluar."""
+    salida.mkdir(parents=True, exist_ok=False)
+    real = tabla["Edad"].to_numpy(dtype=float)
+    referencia = np.full(len(real), mediana_train)
+    resultados = pd.DataFrame([
+        {"Modelo": nombre_modelo, **metricas_regresion(real, pred)},
+        {"Modelo": "Mediana train", **metricas_regresion(real, referencia)},
+    ])
+    resultados.to_csv(salida / "metricas.csv", index=False)
+    print(f"\n{nombre.upper()} — {len(tabla)} pacientes\n{resultados.round(3).to_string(index=False)}", flush=True)
+    predicciones = tabla[["Paciente", "Edad", "Sexo", "Rango_edad", "FE", "FPS"]].copy()
+    predicciones["Edad_predicha"] = pred
+    predicciones["Residuo_real_menos_predicho"] = real - pred
+    predicciones["Error_absoluto"] = np.abs(real - pred)
+    predicciones.to_csv(salida / "predicciones.csv", index=False)
+
+    plotPredictionsOnTwoAxes(pred, tabla, real, salida)
+    plotPredictionsSeparated(pred, tabla, real, salida)
+    plotTwoModels(real, pred, referencia, salida, nombre_modelo=nombre_modelo)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    residuo = real - pred
+    axes[0].scatter(pred, residuo, alpha=0.65)
+    axes[0].axhline(0, color="black", linestyle="--")
+    axes[0].set(xlabel="Edad predicha (años)", ylabel="Real − predicha (años)", title="Residuos")
+    axes[1].hist(residuo, bins="auto", edgecolor="white")
+    axes[1].axvline(0, color="black", linestyle="--")
+    axes[1].set(xlabel="Real − predicha (años)", ylabel="Pacientes", title="Distribución de residuos")
+    guardar_figura(fig, salida, "05_residuos.png")
+
+    # Inspirado en las barras por clase del proyecto crediticio, en unidades de años.
+    fig, ax = plt.subplots(figsize=(8, 4))
+    resultados.set_index("Modelo")[["MAE", "RMSE"]].plot.bar(ax=ax, rot=0)
+    ax.set(ylabel="Error (años)", title="Modelo y referencia: menor es mejor")
+    guardar_figura(fig, salida, "06_barras_metricas.png")
+
+    # Curva acumulada de error absoluto. No es ROC.
+    errores = np.abs(real - pred)
+    errores_ref = np.abs(real - referencia)
+    tolerancias = np.unique(np.r_[0, 5, 10, 20, errores, errores_ref])
+    curvas = pd.DataFrame({
+        "Tolerancia_anios": tolerancias,
+        "Modelo_pct": [(errores <= t).mean() * 100 for t in tolerancias],
+        "Mediana_train_pct": [(errores_ref <= t).mean() * 100 for t in tolerancias],
+    })
+    curvas.to_csv(salida / "curva_tolerancia.csv", index=False)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.step(tolerancias, curvas["Modelo_pct"], where="post", label=nombre_modelo)
+    ax.step(tolerancias, curvas["Mediana_train_pct"], where="post", linestyle="--", label="Mediana de train")
+    for t in (5, 10):
+        ax.axvline(t, color="gray", linestyle=":", alpha=0.6)
+        ax.scatter([t], [100 * np.mean(errores <= t)], color="black", s=20)
+    ax.set(xlabel="Tolerancia de error absoluto (años)", ylabel="Pacientes dentro de tolerancia (%)",
+           title="Curva de tolerancia: más arriba es mejor", ylim=(0, 102), xlim=(0, tolerancias.max()))
+    ax.legend()
+    guardar_figura(fig, salida, "07_curva_tolerancia_no_ROC.png")
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    for ax, campo in zip(axes, ["Sexo", "Rango_edad"]):
+        grupos = predicciones.groupby(campo, observed=True).agg(
+            N=("Paciente", "size"), MAE=("Error_absoluto", "mean")
+        )
+        grupos.to_csv(salida / f"error_por_{campo}.csv")
+        etiquetas = [f"{grupo}\n(n={n})" for grupo, n in zip(grupos.index, grupos["N"])]
+        ax.bar(etiquetas, grupos["MAE"], color="steelblue")
+        ax.set(ylabel="MAE (años)", title=f"Error por {campo}; grupos pequeños: interpretar con cautela")
+        ax.tick_params(axis="x", labelrotation=25)
+    guardar_figura(fig, salida, "08_error_por_sexo_y_edad.png")
+
+    # Adaptación visual del heatmap de confusión: es una tabla DESCRIPTIVA por
+    # intervalos. El modelo continúa prediciendo números, no clases de edad.
+    bordes = np.array([-np.inf, 40, 50, 60, 70, 80, np.inf])
+    etiquetas = ["<40", "40–49", "50–59", "60–69", "70–79", "80+"]
+    reales = pd.cut(real, bordes, labels=etiquetas, right=False)
+    predichos = pd.cut(pred, bordes, labels=etiquetas, right=False)
+    tabla_intervalos = pd.crosstab(reales, predichos, dropna=False).reindex(
+        index=etiquetas, columns=etiquetas, fill_value=0
+    )
+    tabla_intervalos.to_csv(salida / "tabla_intervalos_descriptiva.csv")
+    fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.imshow(tabla_intervalos.to_numpy(), cmap="Greens")
+    ax.set_xticks(range(6), etiquetas)
+    ax.set_yticks(range(6), etiquetas)
+    ax.set(xlabel="Edad predicha agrupada", ylabel="Edad real agrupada",
+           title="Conteos por intervalos — diagnóstico de regresión")
+    for i in range(6):
+        for j in range(6):
+            valor = tabla_intervalos.iloc[i, j]
+            color = "white" if valor > tabla_intervalos.to_numpy().max() / 2 else "black"
+            ax.text(j, i, str(valor), ha="center", va="center", color=color)
+    fig.colorbar(im, ax=ax, label="Pacientes")
+    guardar_figura(fig, salida, "09_mapa_intervalos_descriptivo.png")
+    return resultados
+
+
+# %% 9. Un único programa: autoencoder -> mapa latente -> CNN -> evaluación
+def main():
+    parser = argparse.ArgumentParser(description="Mapa latente y CNN desde cero para edad en CAMUS")
+    parser.add_argument("--prueba", action="store_true", help="1 época, 16+8 pacientes de train; no toca el test")
+    args = parser.parse_args()
+    keras.utils.set_random_seed(SEMILLA)
+    torch.set_num_threads(min(4, os.cpu_count() or 1))
+    plt.style.use("ggplot")
+    df = cargar_dataset()
+    train, val, test = separar_pacientes(df)
+    sufijo = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    salida = CARPETA_RESULTADOS / f"{'prueba' if args.prueba else 'entrenamiento'}_{sufijo}"
+    salida.mkdir(parents=True, exist_ok=False)
+    particiones = df.copy()
+    particiones["Particion"] = "train"
+    particiones.loc[val, "Particion"] = "validacion"
+    particiones.loc[test, "Particion"] = "test"
+    particiones.to_csv(salida / "particiones.csv", index=False)
+
+    if args.prueba:
+        print("PRUEBA TÉCNICA: se usan 24 pacientes de TRAIN. No estima rendimiento ni evalúa TEST.", flush=True)
+        train, val = train[:16], train[16:24]
+        df.iloc[np.r_[train, val]].to_csv(salida / "pacientes_prueba_tecnica.csv", index=False)
+    tabla_train, tabla_val = df.iloc[train].copy(), df.iloc[val].copy()
+    X_train, X_val = prep_pixels(tabla_train), prep_pixels(tabla_val)
+    y_train = tabla_train["Edad"].to_numpy(dtype=np.float32)
+    y_val = tabla_val["Edad"].to_numpy(dtype=np.float32)
+    mediana_train = float(np.median(y_train))
+    if USAR_SOBREMUESTREO:
+        seleccion = sobremuestrear_train(tabla_train)
+    else:
+        seleccion = np.arange(len(tabla_train))
+    tabla_train.iloc[seleccion][["Paciente", "Edad", "Sexo", "Rango_edad"]].to_csv(
+        salida / "muestras_entrenamiento.csv", index=False
+    )
+    print(f"Muestras de train después de sobremuestreo: {len(seleccion)}; pacientes únicos: {len(train)}", flush=True)
+
+    # Inspección de los canales y aumentos, usando SOLO train.
+    ejemplo = X_train[:1]
+    fig, axes = plt.subplots(1, 2, figsize=(7, 4))
+    for canal, ax in enumerate(axes):
+        ax.imshow(ejemplo[0, :, :, canal], cmap="gray", vmin=0, vmax=1)
+        ax.set_title(f"{tabla_train.iloc[0]['Paciente']} — {['ED', 'ES'][canal]}")
+        ax.axis("off")
+    guardar_figura(fig, salida, "00_entrada_ed_es.png")
+
+    configuracion = {
+        "semilla": SEMILLA, "vista": VISTA, "canales": ["ED", "ES"], "tam_imagen": TAM_IMAGEN,
+        "epocas_maximas": 1 if args.prueba else EPOCAS, "batch_size": BATCH_SIZE,
+        "paciencia": PACIENCIA, "learning_rate": TASA_APRENDIZAJE,
+        "regularizacion_l2_cnn": L2_CNN,
+        "capas_con_l2": ["Conv2D(16)", "Conv2D(32)", "Dense(32)"],
+        "sobremuestreo_regresion": USAR_SOBREMUESTREO, "aumentos": False,
+        "filtrado_imagen": False, "seleccion_por_calidad": False,
+        "mediana_train": mediana_train, "pesos_preentrenados": False,
+        "keras": keras.__version__, "torch": torch.__version__, "backend": keras.backend.backend(),
+        "prueba_tecnica": args.prueba,
+        "fuentes_catedra": ["IA2026_NN_Regressor (1).ipynb", "IA2026_CNN_MNIST.ipynb"],
+        "flujo": "imagen -> codificador de autoencoder -> mapa latente -> CNN -> edad",
+        "dimension_latente": list(DIMENSION_LATENTE),
+        "epocas_autoencoder_maximas": 1 if args.prueba else EPOCAS_AUTOENCODER,
+        "paciencia_autoencoder": PACIENCIA_AUTOENCODER,
+        "normalizacion_latente": "media y desvío por canal, solo pacientes únicos de train",
+        "test_evaluado": False,
+    }
+    (salida / "configuracion.json").write_text(json.dumps(configuracion, indent=2), encoding="utf-8")
+    print("\nETAPA 1: aprender el espacio latente reconstruyendo imágenes, sin edades", flush=True)
+    autoencoder, codificador = crear_autoencoder()
+    historial_reconstruccion = entrenar_autoencoder(
+        autoencoder, X_train, X_val, salida / "autoencoder",
+        epocas=1 if args.prueba else EPOCAS_AUTOENCODER,
+    )
+    codificador.trainable = False
+    pesos_codificador = [p.copy() for p in codificador.get_weights()]
+    Z_train = guardar_latentes(codificador, X_train, tabla_train, salida / "latentes_train")
+    Z_val = guardar_latentes(codificador, X_val, tabla_val, salida / "latentes_validacion")
+    print(f"Mapas latentes: train {Z_train.shape}, validación {Z_val.shape}", flush=True)
+
+    print("\nETAPA 2: CNN regresora sobre los mapas latentes congelados", flush=True)
+    keras.utils.set_random_seed(SEMILLA + 1)
+    regresor, media, escala = myModel(Z_train, float(y_train.mean()))
+    etapa_cnn = salida / "cnn_regresora"
+    etapa_cnn.mkdir()
+    np.savez(etapa_cnn / "escala_solo_train.npz", media=media, escala=escala)
+    historial = trainMyModel(
+        regresor, Z_train[seleccion], y_train[seleccion], Z_val, y_val, etapa_cnn,
+        epocas=1 if args.prueba else EPOCAS,
+    )
+    if not all(np.array_equal(a, b) for a, b in zip(pesos_codificador, codificador.get_weights())):
+        raise RuntimeError("El codificador cambió durante el ajuste de la CNN regresora.")
+    entrada = keras.Input(shape=X_train.shape[1:], name="imagenes_ed_es")
+    modelo_final = keras.Model(entrada, regresor(codificador(entrada, training=False)), name="Edad_desde_latente")
+    modelo_final.save(salida / "modelo_final.keras")
+    with (salida / "arquitectura.txt").open("w", encoding="utf-8") as archivo:
+        modelo_final.summary(expand_nested=True, print_fn=lambda linea: archivo.write(linea + "\n"))
+    pred_val = makePredictions(regresor, Z_val, y_val)
+    if not np.allclose(pred_val, makePredictions(modelo_final, X_val, y_val), atol=1e-4, rtol=1e-5):
+        raise RuntimeError("La predicción del modelo completo no coincide con las etapas separadas.")
+    nombre_evaluacion = "Prueba técnica (sin valor de validación)" if args.prueba else "Validación"
+    metricas = evaluar_regresion(tabla_val, pred_val, mediana_train, salida / "validacion",
+                               nombre_evaluacion, nombre_modelo="CNN sobre mapa latente")
+    metricas.to_csv(salida / "comparacion_validacion.csv", index=False)
+    if not args.prueba and metricas.iloc[0]["MAE"] >= metricas.iloc[1]["MAE"]:
+        warnings.warn("La CNN latente no superó a la mediana en MAE de validación.")
+    print("El test quedó reservado; no se leyeron sus imágenes ni se calcularon sus predicciones.")
+    mejor_reconstruccion = int(np.argmin(historial_reconstruccion.history["val_loss"])) + 1
+    mejor_regresion = int(np.argmin(historial.history["val_mae"])) + 1
+    print(f"\nMejor época de reconstrucción: {mejor_reconstruccion}; de edad: {mejor_regresion}. "
+          f"Resultados en: {salida}", flush=True)
+    if MOSTRAR_GRAFICOS:
+        plt.show()
+
+
+if __name__ == "__main__":
+    main()

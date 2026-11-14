@@ -1,0 +1,25 @@
+{
+  "semilla": 42,
+  "vista": "4CH",
+  "canales": [
+    "ED",
+    "ES"
+  ],
+  "tam_imagen": 128,
+  "epocas_maximas": 1,
+  "batch_size": 16,
+  "paciencia": 12,
+  "learning_rate": 0.001,
+  "sobremuestreo": true,
+  "aumentos": true,
+  "mediana_train": 59.0,
+  "pesos_preentrenados": false,
+  "keras": "3.15.1",
+  "torch": "2.15.0+cpu",
+  "backend": "torch",
+  "prueba_tecnica": true,
+  "fuentes_catedra": [
+    "IA2026_NN_Regressor (1).ipynb",
+    "IA2026_CNN_MNIST.ipynb"
+  ]
+}

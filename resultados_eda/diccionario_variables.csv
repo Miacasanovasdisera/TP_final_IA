@@ -1,0 +1,14 @@
+﻿Variable,Descripción
+Paciente,Carpeta que identifica al paciente; no es una variable predictora.
+Edad,Edad cronológica en años; variable objetivo continua (Age).
+Sexo,Sexo registrado en el dataset (Sex); variable categórica.
+FE_2CH,Fracción de eyección (%) declarada en Info_2CH.cfg (EF).
+FE_4CH,Fracción de eyección (%) declarada en Info_4CH.cfg (EF).
+Calidad_2CH,Calidad de imagen de la vista de dos cámaras (ImageQuality).
+Calidad_4CH,Calidad de imagen de la vista de cuatro cámaras.
+Fotogramas_2CH,Cantidad de fotogramas declarada en la vista 2CH (NbFrame).
+Fotogramas_4CH,Cantidad de fotogramas declarada en la vista 4CH.
+FPS_2CH,Frecuencia de adquisición de la vista 2CH (FrameRate).
+FPS_4CH,Frecuencia de adquisición de la vista 4CH.
+Archivos_imagen,"Cantidad de archivos de imágenes, sin máscaras de segmentación."
+Archivos_mascara,Cantidad de archivos de segmentación (_gt).
